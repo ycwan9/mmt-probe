@@ -59,21 +59,27 @@ static inline void _write_behaviour_report( file_output_t *output,
 #ifndef SIMPLE_REPORT
 //This callback is called by DPI periodically
 static inline void _print_ip_session_report (const mmt_session_t * dpi_session, session_stat_t * session_stat, const dpi_context_t *context){
-	uint64_t ul_packets = get_session_total_ul_packet_count(dpi_session);
-	uint64_t dl_packets = get_session_total_dl_packet_count(dpi_session);
+	bool is_inner = session_stat->is_gtp_inner;
+	uint64_t ul_packets = is_inner ? session_stat->inner_packets.upload : get_session_total_ul_packet_count(dpi_session);
+	uint64_t dl_packets = is_inner ? session_stat->inner_packets.download : get_session_total_dl_packet_count(dpi_session);
 	uint64_t total_packets = ul_packets + dl_packets;
 
 	// check the condition if in the last interval there was a protocol activity or not
 	// => no new packets since the last report times
-	if( total_packets == (session_stat->packets.upload + session_stat->packets.download) )
-		return;
+	if( is_inner ){
+		if( total_packets == (session_stat->saved_inner_packets.upload + session_stat->saved_inner_packets.download) )
+			return;
+	} else {
+		if( total_packets == (session_stat->packets.upload + session_stat->packets.download) )
+			return;
+	}
 
-	uint64_t ul_volumes = get_session_total_ul_byte_count(dpi_session);
-	uint64_t dl_volumes = get_session_total_dl_byte_count(dpi_session);
+	uint64_t ul_volumes = is_inner ? session_stat->inner_volumes.upload : get_session_total_ul_byte_count(dpi_session);
+	uint64_t dl_volumes = is_inner ? session_stat->inner_volumes.download : get_session_total_dl_byte_count(dpi_session);
 	uint64_t total_volumes = ul_volumes + dl_volumes;
 
-	uint64_t ul_payload = get_session_total_ul_data_byte_count(dpi_session);
-	uint64_t dl_payload = get_session_total_dl_data_byte_count(dpi_session);
+	uint64_t ul_payload = is_inner ? session_stat->inner_payload.upload : get_session_total_ul_data_byte_count(dpi_session);
+	uint64_t dl_payload = is_inner ? session_stat->inner_payload.download : get_session_total_dl_data_byte_count(dpi_session);
 	uint64_t total_payload = ul_payload + dl_payload;
 
 	const proto_hierarchy_t * proto_hierarchy = get_session_protocol_hierarchy(dpi_session);
@@ -128,6 +134,32 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 
 	struct timeval start_time = get_session_init_time(dpi_session);
 
+	// For GTP inner, data should be inside tunnel (inner headers), not outer tunnel overhead
+	uint64_t total_volumes_delta, total_payload_delta, total_packets_delta;
+	uint64_t ul_volumes_delta, ul_payload_delta, ul_packets_delta;
+	uint64_t dl_volumes_delta, dl_payload_delta, dl_packets_delta;
+	if (is_inner) {
+		total_volumes_delta = total_volumes - (session_stat->saved_inner_volumes.upload + session_stat->saved_inner_volumes.download);
+		total_payload_delta = total_payload - (session_stat->saved_inner_payload.upload + session_stat->saved_inner_payload.download);
+		total_packets_delta = total_packets - (session_stat->saved_inner_packets.upload + session_stat->saved_inner_packets.download);
+		ul_volumes_delta = ul_volumes - session_stat->saved_inner_volumes.upload;
+		ul_payload_delta = ul_payload - session_stat->saved_inner_payload.upload;
+		ul_packets_delta = ul_packets - session_stat->saved_inner_packets.upload;
+		dl_volumes_delta = dl_volumes - session_stat->saved_inner_volumes.download;
+		dl_payload_delta = dl_payload - session_stat->saved_inner_payload.download;
+		dl_packets_delta = dl_packets - session_stat->saved_inner_packets.download;
+	} else {
+		total_volumes_delta = total_volumes - (session_stat->volumes.upload + session_stat->volumes.download);
+		total_payload_delta = total_payload - (session_stat->payload.upload + session_stat->payload.download);
+		total_packets_delta = total_packets - (session_stat->packets.upload + session_stat->packets.download);
+		ul_volumes_delta = ul_volumes - session_stat->volumes.upload;
+		ul_payload_delta = ul_payload - session_stat->payload.upload;
+		ul_packets_delta = ul_packets - session_stat->packets.upload;
+		dl_volumes_delta = dl_volumes - session_stat->volumes.download;
+		dl_payload_delta = dl_payload - session_stat->payload.download;
+		dl_packets_delta = dl_packets - session_stat->packets.download;
+	}
+
 	char message[ MAX_LENGTH_REPORT_MESSAGE + 1 ];
 	int valid = 0;
 	STRING_BUILDER_WITH_SEPARATOR( valid, message, MAX_LENGTH_REPORT_MESSAGE, ",",
@@ -136,15 +168,15 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 		__STR( path_ul),
 		__STR( path_dl),
 		__INT( total_active_sessions),
-		__INT( total_volumes - (session_stat->volumes.upload + session_stat->volumes.download)),
-		__INT( total_payload - (session_stat->payload.upload + session_stat->payload.download)),
-		__INT( total_packets - (session_stat->packets.upload + session_stat->packets.download)),
-		__INT( ul_volumes - session_stat->volumes.upload),
-		__INT( ul_payload - session_stat->payload.upload),
-		__INT( ul_packets - session_stat->packets.upload),
-		__INT( dl_volumes - session_stat->volumes.download),
-		__INT( dl_payload - session_stat->payload.download),
-		__INT( dl_packets - session_stat->packets.download),
+		__INT( total_volumes_delta),
+		__INT( total_payload_delta),
+		__INT( total_packets_delta),
+		__INT( ul_volumes_delta),
+		__INT( ul_payload_delta),
+		__INT( ul_packets_delta),
+		__INT( dl_volumes_delta),
+		__INT( dl_payload_delta),
+		__INT( dl_packets_delta),
 		__TIME( &start_time ),
 		__STR( session_stat->ip_src.ip_string ),
 		__STR( session_stat->ip_dst.ip_string ),
@@ -226,20 +258,29 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 				proto_id,
 				session_stat->ip_src.ip_string,
 				session_stat->ip_dst.ip_string,
-				ul_volumes - session_stat->volumes.upload,
-				dl_volumes - session_stat->volumes.download
+				ul_volumes_delta,
+				dl_volumes_delta
 		);
 
 
 	//remember the current statistics
-	session_stat->volumes.upload = ul_volumes;
-	session_stat->volumes.download = dl_volumes;
+	if (is_inner) {
+		session_stat->saved_inner_volumes.upload = ul_volumes;
+		session_stat->saved_inner_volumes.download = dl_volumes;
+		session_stat->saved_inner_payload.upload = ul_payload;
+		session_stat->saved_inner_payload.download = dl_payload;
+		session_stat->saved_inner_packets.upload = ul_packets;
+		session_stat->saved_inner_packets.download = dl_packets;
+	} else {
+		session_stat->volumes.upload = ul_volumes;
+		session_stat->volumes.download = dl_volumes;
 
-	session_stat->payload.upload = ul_payload;
-	session_stat->payload.download = dl_payload;
+		session_stat->payload.upload = ul_payload;
+		session_stat->payload.download = dl_payload;
 
-	session_stat->packets.upload = ul_packets;
-	session_stat->packets.download = dl_packets;
+		session_stat->packets.upload = ul_packets;
+		session_stat->packets.download = dl_packets;
+	}
 
 #ifdef QOS_MODULE
 
@@ -261,11 +302,21 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 //This callback is called by DPI periodically
 static inline void _print_ip_session_report (const mmt_session_t * dpi_session, session_stat_t * session, const dpi_context_t *context){
 
-	uint64_t ul_volumes = get_session_total_ul_byte_count(dpi_session);
-	uint64_t dl_volumes = get_session_total_dl_byte_count(dpi_session);
+	bool is_inner = session->is_gtp_inner;
+	uint64_t ul_volumes = is_inner ? session->inner_volumes.upload : get_session_total_ul_byte_count(dpi_session);
+	uint64_t dl_volumes = is_inner ? session->inner_volumes.download : get_session_total_dl_byte_count(dpi_session);
 
 	if( unlikely( ul_volumes + dl_volumes == 0 ))
 		return;
+
+	// delta check for inner vs outer
+	if (is_inner) {
+		if (ul_volumes == session->saved_inner_volumes.upload && dl_volumes == session->saved_inner_volumes.download)
+			return;
+	} else {
+		if (ul_volumes == session->volumes.upload && dl_volumes == session->volumes.download)
+			return;
+	}
 
 	struct timeval last_activity_time = get_session_last_activity_time( dpi_session );
 
@@ -280,6 +331,9 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 			proto_hierarchy,
 			app_path, sizeof( app_path) );
 
+	uint64_t ul_delta = is_inner ? ul_volumes - session->saved_inner_volumes.upload : ul_volumes - session->volumes.upload;
+	uint64_t dl_delta = is_inner ? dl_volumes - session->saved_inner_volumes.download : dl_volumes - session->volumes.download;
+
 	char message[ MAX_LENGTH_REPORT_MESSAGE + 1 ];
 	int valid = 0;
 	STRING_BUILDER_WITH_SEPARATOR( valid, message, MAX_LENGTH_REPORT_MESSAGE, ",",
@@ -287,8 +341,8 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 			__INT( proto_id ),
 			__STR( app_path ),
 
-			__INT( ul_volumes - session->volumes.upload ),
-			__INT( dl_volumes - session->volumes.download ),
+			__INT( ul_delta ),
+			__INT( dl_delta ),
 
 			__STR( session->ip_src.ip_string ),
 			__STR( session->ip_dst.ip_string ),
@@ -318,13 +372,18 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 				proto_id,
 				session->ip_src.ip_string,
 				session->ip_dst.ip_string,
-				ul_volumes - session->volumes.upload,
-				dl_volumes - session->volumes.download
+				ul_delta,
+				dl_delta
 		);
 
 	//remember the current ul and dl data volumes
-	session->volumes.upload   = ul_volumes;
-	session->volumes.download = dl_volumes;
+	if (is_inner) {
+		session->saved_inner_volumes.upload   = ul_volumes;
+		session->saved_inner_volumes.download = dl_volumes;
+	} else {
+		session->volumes.upload   = ul_volumes;
+		session->volumes.download = dl_volumes;
+	}
 }
 #endif
 
@@ -354,9 +413,30 @@ session_stat_t *session_report_callback_on_starting_session ( const ipacket_t * 
 
 	const bool is_session_over_ipv4 = (proto_session_id == PROTO_IP);
 
+	// Detect GTP inner session: session IP is after GTP in hierarchy
+	int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
+	bool is_gtp_inner_session = (gtp_idx >= 0 && (int)proto_session_index > gtp_idx);
+	session_stat->is_gtp_inner = is_gtp_inner_session;
+	// For GTP inner, init inner counters already zero via calloc
 
-	uint8_t *src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
-	uint8_t *dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+	uint8_t *src = NULL, *dst = NULL;
+	// For IP-over-GTP (no inner ETH) keep outer MAC as per requirement.
+	// For ETH-over-GTP (inner ETH exists at gtp+1), use inner MAC.
+	if (is_gtp_inner_session) {
+		int inner_eth_idx = gtp_idx + 1;
+		if (inner_eth_idx < (int)ipacket->proto_hierarchy->len &&
+				get_protocol_id_at_index(ipacket, inner_eth_idx) == PROTO_ETHERNET) {
+			src = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_SRC, inner_eth_idx);
+			dst = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_DST, inner_eth_idx);
+		} else {
+			// IP GTP: keep outer MAC (as per spec)
+			src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
+			dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+		}
+	} else {
+		src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
+		dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+	}
 
 	if (likely( src ))
 		assign_6bytes( session_stat->mac_src, src );
@@ -469,6 +549,59 @@ static inline int32_t _get_protocol_index_after_session( uint32_t proto_id, cons
 }
 
 int session_report_callback_on_receiving_packet(const ipacket_t * ipacket, session_stat_t * session_stat, dpi_context_t *context ){
+
+	// GTP inner accounting: data volume/packets/payload should be inside GTP, not outer tunnel
+	if (session_stat->is_gtp_inner) {
+		int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
+		if (gtp_idx >= 0) {
+			int inner_start = gtp_idx + 1;
+			if (inner_start < (int)ipacket->proto_hierarchy->len) {
+				int offset = get_packet_offset_at_index(ipacket, inner_start);
+				if (offset >= 0 && offset < (int)ipacket->p_hdr->len) {
+					uint32_t inner_len = ipacket->p_hdr->len - offset;
+					// Use caplen if packet was truncated? Prefer len for wire length (as outer does)
+					// direction: inner session direction
+					uint8_t dir = !!get_session_last_packet_direction(ipacket->session);
+					if (dir == DIRECTION_UPLOAD)
+						session_stat->inner_volumes.upload += inner_len;
+					else
+						session_stat->inner_volumes.download += inner_len;
+#ifndef SIMPLE_REPORT
+					if (dir == DIRECTION_UPLOAD)
+						session_stat->inner_packets.upload += 1;
+					else
+						session_stat->inner_packets.download += 1;
+
+					// payload: try to get inner L4 payload
+					uint32_t payload_len = 0;
+					int32_t tcp_idx = _get_protocol_index_after_session(PROTO_TCP, ipacket->session);
+					if (tcp_idx != -1) {
+						uint32_t *tcp_pl = (uint32_t*) get_attribute_extracted_data_at_index(ipacket, PROTO_TCP, TCP_PAYLOAD_LEN, tcp_idx);
+						if (tcp_pl) payload_len = *tcp_pl;
+					} else {
+						int32_t udp_idx = _get_protocol_index_after_session(PROTO_UDP, ipacket->session);
+						if (udp_idx != -1) {
+							uint16_t *udp_len = (uint16_t*) get_attribute_extracted_data_at_index(ipacket, PROTO_UDP, UDP_LEN, udp_idx);
+							if (udp_len) {
+								// general_short_extraction_with_ordering_change already converts to host order
+								uint16_t ulen = *udp_len;
+								if (ulen >= 8) payload_len = ulen - 8;
+							}
+						}
+					}
+					// fallback: if payload_len still 0, estimate as inner_len minus headers (ETH14 + IP20 + 8/20)
+					// For now keep 0 if not TCP/UDP - data volume already accounts
+					if (payload_len > 0) {
+						if (dir == DIRECTION_UPLOAD)
+							session_stat->inner_payload.upload += payload_len;
+						else
+							session_stat->inner_payload.download += payload_len;
+					}
+#endif
+				}
+			}
+		}
+	}
 
 #ifndef SIMPLE_REPORT
 
@@ -588,6 +721,13 @@ static inline void
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_DST);
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_SERVER_PORT);
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_CLIENT_PORT);
+
+	// For GTP inner volume/payload accounting (inner packet inside tunnel)
+	ret &= register_extraction_attribute(mmt_handler, PROTO_IP, IP_HEADER_LEN);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_IP, IP_TOT_LEN);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_UDP, UDP_LEN);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_TCP, TCP_DATA_OFF);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_TCP, TCP_PAYLOAD_LEN);
 
 #ifdef QOS_MODULE
 	ret &= register_extraction_attribute(mmt_handler, PROTO_TCP, TCP_RETRANSMISSION);

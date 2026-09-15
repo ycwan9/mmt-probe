@@ -74,11 +74,21 @@ typedef struct session_stat_struct {
 	uint8_t  mac_dst[6];
 
 	flow_stat_data_t volumes;
+	// GTP inner session flag and volume: valid for both SIMPLE and full reports
+	bool is_gtp_inner;
+	flow_stat_data_t inner_volumes;
+	flow_stat_data_t saved_inner_volumes;
 
 //we don't need these parameters in simple version for MMT-BOX
 #ifndef SIMPLE_REPORT
 	flow_stat_data_t payload;
 	flow_stat_data_t packets;
+
+	// GTP inner packet tracking for full report: payload/packets inner
+	flow_stat_data_t inner_payload;
+	flow_stat_data_t inner_packets;
+	flow_stat_data_t saved_inner_payload;
+	flow_stat_data_t saved_inner_packets;
 
 	uint16_t content_class;
 
