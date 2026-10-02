@@ -101,6 +101,7 @@ static void _protocols_stats_iterator(uint32_t proto_id, void * args) {
 			if (proto_hierarchy.len >= 3 &&
 				proto_hierarchy.proto_path[proto_hierarchy.len - 1] == (int) proto_id &&
 				proto_hierarchy.proto_path[proto_hierarchy.len - 2] == PROTO_ETHERNET &&
+				proto_id != PROTO_ARP && // ARP now reported as session (id=100) per requirement
 				_is_leaf_stats(context->dpi_handler, proto_stats, proto_id)) {
 
 				offset = 0;

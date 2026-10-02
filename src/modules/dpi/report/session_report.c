@@ -24,6 +24,15 @@ int print_ftp_report(char *message, size_t message_size, const mmt_session_t * d
 int print_rtp_report(char *message, size_t message_size, const mmt_session_t * dpi_session, session_stat_t *session_stat, const dpi_context_t *context);
 int print_gtp_report(char *message, size_t message_size, const mmt_session_t * dpi_session, session_stat_t *session_stat, const dpi_context_t *context);
 
+static inline bool _is_zero_mac(const uint8_t *mac) {
+	if (!mac) return true;
+	return mac[0]==0 && mac[1]==0 && mac[2]==0 && mac[3]==0 && mac[4]==0 && mac[5]==0;
+}
+static inline bool _is_broadcast_mac(const uint8_t *mac) {
+	if (!mac) return false;
+	return mac[0]==0xff && mac[1]==0xff && mac[2]==0xff && mac[3]==0xff && mac[4]==0xff && mac[5]==0xff;
+}
+
 
 static inline void _write_behaviour_report( file_output_t *output,
 		int probe_id,
@@ -59,7 +68,10 @@ static inline void _write_behaviour_report( file_output_t *output,
 #ifndef SIMPLE_REPORT
 //This callback is called by DPI periodically
 static inline void _print_ip_session_report (const mmt_session_t * dpi_session, session_stat_t * session_stat, const dpi_context_t *context){
-	bool is_inner = session_stat->is_gtp_inner;
+	const proto_hierarchy_t *proto_hierarchy = get_session_protocol_hierarchy(dpi_session);
+	int proto_id = proto_hierarchy->proto_path[proto_hierarchy->len - 1];
+	bool is_arp = (proto_id == PROTO_ARP);
+	bool is_inner = session_stat->is_gtp_inner || is_arp;
 	uint64_t ul_packets = is_inner ? session_stat->inner_packets.upload : get_session_total_ul_packet_count(dpi_session);
 	uint64_t dl_packets = is_inner ? session_stat->inner_packets.download : get_session_total_dl_packet_count(dpi_session);
 	uint64_t total_packets = ul_packets + dl_packets;
@@ -81,9 +93,6 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 	uint64_t ul_payload = is_inner ? session_stat->inner_payload.upload : get_session_total_ul_data_byte_count(dpi_session);
 	uint64_t dl_payload = is_inner ? session_stat->inner_payload.download : get_session_total_dl_data_byte_count(dpi_session);
 	uint64_t total_payload = ul_payload + dl_payload;
-
-	const proto_hierarchy_t * proto_hierarchy = get_session_protocol_hierarchy(dpi_session);
-	int proto_id = proto_hierarchy->proto_path[ proto_hierarchy->len - 1 ];
 
 
 	char path_ul[128], path_dl[128];
@@ -302,7 +311,12 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 //This callback is called by DPI periodically
 static inline void _print_ip_session_report (const mmt_session_t * dpi_session, session_stat_t * session, const dpi_context_t *context){
 
-	bool is_inner = session->is_gtp_inner;
+	const proto_hierarchy_t *proto_hierarchy = get_session_protocol_hierarchy(dpi_session);
+	int proto_id = 0;
+	if( likely( proto_hierarchy->len > 0 ))
+		proto_id = proto_hierarchy->proto_path[ proto_hierarchy->len - 1 ];
+	bool is_arp = (proto_id == PROTO_ARP);
+	bool is_inner = session->is_gtp_inner || is_arp;
 	uint64_t ul_volumes = is_inner ? session->inner_volumes.upload : get_session_total_ul_byte_count(dpi_session);
 	uint64_t dl_volumes = is_inner ? session->inner_volumes.download : get_session_total_dl_byte_count(dpi_session);
 
@@ -319,11 +333,6 @@ static inline void _print_ip_session_report (const mmt_session_t * dpi_session, 
 	}
 
 	struct timeval last_activity_time = get_session_last_activity_time( dpi_session );
-
-	const proto_hierarchy_t * proto_hierarchy = get_session_protocol_hierarchy(dpi_session);
-	int proto_id = 0;
-	if( likely( proto_hierarchy->len > 0 ))
-		proto_id = proto_hierarchy->proto_path[ proto_hierarchy->len - 1 ];
 
 	char app_path[128];
 
@@ -405,46 +414,107 @@ session_stat_t *session_report_callback_on_starting_session ( const ipacket_t * 
 	// Flow extraction
 	const uint32_t proto_session_id = get_protocol_id_at_index(ipacket, proto_session_index);
 
-	//must be either PROTO_IP or PROTO_IPV6
-	if( unlikely( proto_session_id != PROTO_IP && proto_session_id != PROTO_IPV6 )){
-		DEBUG("session of packet %lu is not on top of IP nor IPv6, but %d", ipacket->packet_id, proto_session_id );
+	//must be either PROTO_IP, PROTO_IPV6 or PROTO_ARP (ARP now sessionized)
+	if( unlikely( proto_session_id != PROTO_IP && proto_session_id != PROTO_IPV6 && proto_session_id != PROTO_ARP )){
+		DEBUG("session of packet %lu is not on top of IP nor IPv6 nor ARP, but %d", ipacket->packet_id, proto_session_id );
 		return NULL;
 	}
 
-	const bool is_session_over_ipv4 = (proto_session_id == PROTO_IP);
-
-	// Detect GTP inner session: session IP is after GTP in hierarchy
+	// Detect GTP inner session: session proto is after GTP in hierarchy
 	int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
 	bool is_gtp_inner_session = (gtp_idx >= 0 && (int)proto_session_index > gtp_idx);
 	session_stat->is_gtp_inner = is_gtp_inner_session;
-	// For GTP inner, init inner counters already zero via calloc
+	// For GTP inner, inner counters already zero via calloc
 
-	uint8_t *src = NULL, *dst = NULL;
-	// For IP-over-GTP (no inner ETH) keep outer MAC as per requirement.
-	// For ETH-over-GTP (inner ETH exists at gtp+1), use inner MAC.
-	if (is_gtp_inner_session) {
-		int inner_eth_idx = gtp_idx + 1;
-		if (inner_eth_idx < (int)ipacket->proto_hierarchy->len &&
-				get_protocol_id_at_index(ipacket, inner_eth_idx) == PROTO_ETHERNET) {
-			src = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_SRC, inner_eth_idx);
-			dst = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_DST, inner_eth_idx);
+	if (proto_session_id == PROTO_ARP) {
+		// ARP session: keyed by SPA+TPA (IP pair), MAC selection prefers non-zero/broadcast
+		// ETH candidate: inner ETH if GTP inner, else outer ETH (index = proto_session_index-1 or gtp+1)
+		uint8_t *eth_src = NULL, *eth_dst = NULL;
+		if (is_gtp_inner_session) {
+			int inner_eth_idx = gtp_idx + 1;
+			if (inner_eth_idx < (int)ipacket->proto_hierarchy->len &&
+					get_protocol_id_at_index(ipacket, inner_eth_idx) == PROTO_ETHERNET) {
+				eth_src = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_SRC, inner_eth_idx);
+				eth_dst = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_DST, inner_eth_idx);
+			} else {
+				eth_src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
+				eth_dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+			}
 		} else {
-			// IP GTP: keep outer MAC (as per spec)
+			// outer ARP directly after ETH
+			int eth_idx = (int)proto_session_index - 1;
+			if (eth_idx >= 0 && get_protocol_id_at_index(ipacket, eth_idx) == PROTO_ETHERNET) {
+				eth_src = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_SRC, eth_idx);
+				eth_dst = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_DST, eth_idx);
+			} else {
+				eth_src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
+				eth_dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+			}
+		}
+		uint8_t *arp_sha = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ARP, ARP_AR_SHA, proto_session_index);
+		uint8_t *arp_tha = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ARP, ARP_AR_THA, proto_session_index);
+		uint8_t *src = NULL, *dst = NULL;
+		if (arp_sha && !_is_zero_mac(arp_sha) && !_is_broadcast_mac(arp_sha))
+			src = arp_sha;
+		else
+			src = eth_src;
+		if (arp_tha && !_is_zero_mac(arp_tha) && !_is_broadcast_mac(arp_tha))
+			dst = arp_tha;
+		else
+			dst = eth_dst;
+		// Fallback if still NULL
+		if (!src) src = eth_src;
+		if (!dst) dst = eth_dst;
+		if (likely(src)) assign_6bytes(session_stat->mac_src, src);
+		if (likely(dst)) assign_6bytes(session_stat->mac_dst, dst);
+
+		// IP from ARP SIP/TIP (IPv4)
+		uint32_t *sip = (uint32_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ARP, ARP_AR_SIP, proto_session_index);
+		uint32_t *tip = (uint32_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ARP, ARP_AR_TIP, proto_session_index);
+	
+		if (sip) {
+			session_stat->ip_src.ipv4 = *sip;
+			inet_ntop4(session_stat->ip_src.ipv4, session_stat->ip_src.ip_string);
+		} else {
+			session_stat->ip_src.ip_string[0] = '\0';
+		}
+		if (tip) {
+			session_stat->ip_dst.ipv4 = *tip;
+			inet_ntop4(session_stat->ip_dst.ipv4, session_stat->ip_dst.ip_string);
+		} else {
+			session_stat->ip_dst.ip_string[0] = '\0';
+		}
+		session_stat->port_src = 0;
+		session_stat->port_dst = 0;
+	} else {
+		const bool is_session_over_ipv4 = (proto_session_id == PROTO_IP);
+
+		uint8_t *src = NULL, *dst = NULL;
+		// For IP-over-GTP (no inner ETH) keep outer MAC as per requirement.
+		// For ETH-over-GTP (inner ETH exists at gtp+1), use inner MAC.
+		if (is_gtp_inner_session) {
+			int inner_eth_idx = gtp_idx + 1;
+			if (inner_eth_idx < (int)ipacket->proto_hierarchy->len &&
+					get_protocol_id_at_index(ipacket, inner_eth_idx) == PROTO_ETHERNET) {
+				src = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_SRC, inner_eth_idx);
+				dst = (uint8_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_ETHERNET, ETH_DST, inner_eth_idx);
+			} else {
+				// IP GTP: keep outer MAC (as per spec)
+				src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
+				dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
+			}
+		} else {
 			src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
 			dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
 		}
-	} else {
-		src = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_SRC);
-		dst = (uint8_t *) get_attribute_extracted_data(ipacket, PROTO_ETHERNET, ETH_DST);
-	}
 
-	if (likely( src ))
-		assign_6bytes( session_stat->mac_src, src );
-	if (likely( dst ))
-		assign_6bytes( session_stat->mac_dst, dst );
+		if (likely( src ))
+			assign_6bytes( session_stat->mac_src, src );
+		if (likely( dst ))
+			assign_6bytes( session_stat->mac_dst, dst );
 
-	//IPV4
-	if (likely( is_session_over_ipv4 )) {
+		//IPV4
+		if (likely( is_session_over_ipv4 )) {
 
 		uint32_t * ip_src = (uint32_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_IP, IP_SRC, proto_session_index);
 		uint32_t * ip_dst = (uint32_t *) get_attribute_extracted_data_at_index(ipacket, PROTO_IP, IP_DST, proto_session_index);
@@ -485,7 +555,8 @@ session_stat_t *session_report_callback_on_starting_session ( const ipacket_t * 
 			session_stat->port_src = *cport;
 		if (likely( dport ))
 			session_stat->port_dst = *dport;
-	}
+		}
+	} // end non-ARP
 
 #ifdef QOS_MODULE
 	//initialize a data structure to calculate RTT of data packets
@@ -551,14 +622,34 @@ static inline int32_t _get_protocol_index_after_session( uint32_t proto_id, cons
 int session_report_callback_on_receiving_packet(const ipacket_t * ipacket, session_stat_t * session_stat, dpi_context_t *context ){
 
 	// GTP inner accounting: data volume/packets/payload should be inside GTP, not outer tunnel
-	if (session_stat->is_gtp_inner) {
-		int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
-		if (gtp_idx >= 0) {
-			int inner_start = gtp_idx + 1;
-			if (inner_start < (int)ipacket->proto_hierarchy->len) {
-				int offset = get_packet_offset_at_index(ipacket, inner_start);
-				if (offset >= 0 && offset < (int)ipacket->p_hdr->len) {
-					uint32_t inner_len = ipacket->p_hdr->len - offset;
+	// Also ARP outer (no DPI byte counters) needs manual accounting
+	uint32_t sess_proto = 0;
+	if (ipacket->session) {
+		uint32_t sess_idx = get_session_protocol_index(ipacket->session);
+		sess_proto = get_protocol_id_at_index(ipacket, sess_idx);
+	}
+	bool is_arp = (sess_proto == PROTO_ARP);
+	bool need_inner = session_stat->is_gtp_inner || is_arp;
+	if (need_inner) {
+		int offset = -1;
+		if (is_arp) {
+			if (session_stat->is_gtp_inner) {
+				int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
+				if (gtp_idx >= 0) offset = get_packet_offset_at_index(ipacket, gtp_idx + 1);
+			} else {
+				offset = 0; // outer ARP: full packet
+			}
+		} else {
+			int gtp_idx = get_protocol_index_by_id(ipacket, PROTO_GTP);
+			if (gtp_idx >= 0) {
+				int inner_start = gtp_idx + 1;
+				if (inner_start < (int)ipacket->proto_hierarchy->len) {
+					offset = get_packet_offset_at_index(ipacket, inner_start);
+				}
+			}
+		}
+		if (offset >= 0 && offset < (int)ipacket->p_hdr->len) {
+			uint32_t inner_len = ipacket->p_hdr->len - offset;
 					// Use caplen if packet was truncated? Prefer len for wire length (as outer does)
 					// direction: inner session direction
 					uint8_t dir = !!get_session_last_packet_direction(ipacket->session);
@@ -599,8 +690,6 @@ int session_report_callback_on_receiving_packet(const ipacket_t * ipacket, sessi
 					}
 #endif
 				}
-			}
-		}
 	}
 
 #ifndef SIMPLE_REPORT
@@ -721,6 +810,12 @@ static inline void
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_DST);
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_SERVER_PORT);
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IPV6, IP6_CLIENT_PORT);
+
+	ret &= register_extraction_attribute(mmt_handler, PROTO_ARP, ARP_AR_SHA);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_ARP, ARP_AR_SIP);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_ARP, ARP_AR_THA);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_ARP, ARP_AR_TIP);
+	ret &= register_extraction_attribute(mmt_handler, PROTO_ARP, ARP_AR_OP);
 
 	// For GTP inner volume/payload accounting (inner packet inside tunnel)
 	ret &= register_extraction_attribute(mmt_handler, PROTO_IP, IP_HEADER_LEN);
