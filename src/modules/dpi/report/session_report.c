@@ -621,6 +621,8 @@ static inline int32_t _get_protocol_index_after_session( uint32_t proto_id, cons
 
 int session_report_callback_on_receiving_packet(const ipacket_t * ipacket, session_stat_t * session_stat, dpi_context_t *context ){
 
+	if (unlikely(session_stat == NULL))
+		return 0;
 	// GTP inner accounting: data volume/packets/payload should be inside GTP, not outer tunnel
 	// Also ARP outer (no DPI byte counters) needs manual accounting
 	uint32_t sess_proto = 0;
